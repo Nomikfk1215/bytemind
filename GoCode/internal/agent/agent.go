@@ -29,7 +29,7 @@ type taskPlan struct {
 
 func New(client *llm.Client, runtime *tools.Runtime, store *session.Store, confirm ConfirmFunc, maxTurns int) *Agent {
 	if maxTurns <= 0 {
-		maxTurns = 10
+		maxTurns = 30
 	}
 	return &Agent{
 		client:   client,
@@ -55,7 +55,7 @@ func (a *Agent) RunTask(ctx context.Context, input string) (session.TaskRecord, 
 	}
 	a.store.SetPlan(plan.Steps)
 	if planErr != nil {
-		return a.store.FailCurrentTask("规划失败: " + planErr.Error()), planErr
+		return a.store.FailCurrentTask("PlanError: " + planErr.Error()), planErr
 	}
 
 	messages := executorMessages(a.runtime.Workspace(), a.store.HistoryDigest(3), plan, input)
@@ -64,14 +64,14 @@ func (a *Agent) RunTask(ctx context.Context, input string) (session.TaskRecord, 
 	for turn := 0; turn < a.maxTurns; turn++ {
 		message, err := a.client.Chat(ctx, messages, toolDefs)
 		if err != nil {
-			return a.store.FailCurrentTask("执行失败: " + err.Error()), err
+			return a.store.FailCurrentTask("Execution Failed: " + err.Error()), err
 		}
 
 		messages = append(messages, message)
 		if len(message.ToolCalls) == 0 {
 			finalNote := strings.TrimSpace(message.Content)
 			if finalNote == "" {
-				finalNote = "任务已执行完成。"
+				finalNote = "Execution Completed."
 			}
 			a.store.SetAssistant(finalNote)
 			return a.store.CompleteTask("completed"), nil
