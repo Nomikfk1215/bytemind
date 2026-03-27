@@ -205,20 +205,20 @@ func TestHandleSlashCommandReportsUnknownCommandSuggestions(t *testing.T) {
 	}
 }
 
-func TestRunChatRejectsWorkspaceFlag(t *testing.T) {
+func TestRunChatAcceptsWorkspaceFlag(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
 	err := runChat([]string{"-workspace", `E:\\repo`}, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
-		t.Fatal("expected -workspace to be rejected")
+		t.Fatal("expected chat to fail later because config is incomplete")
 	}
-	if !strings.Contains(err.Error(), "flag provided but not defined") {
+	if strings.Contains(err.Error(), "flag provided but not defined") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestRunChatPrintsSessionBannerAndQuits(t *testing.T) {
+func TestBootstrapCreatesSessionInWorkspace(t *testing.T) {
 	workspace := t.TempDir()
 	t.Chdir(workspace)
 	writeTestConfig(t, workspace, map[string]any{
@@ -231,15 +231,18 @@ func TestRunChatPrintsSessionBannerAndQuits(t *testing.T) {
 		"stream": false,
 	})
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	err := runChat(nil, strings.NewReader("/quit\n"), &stdout, &stderr)
+	runner, store, sess, err := bootstrap("", "", "", "", "", 0, strings.NewReader(""), &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := stdout.String()
-	if !strings.Contains(output, "session") || !strings.Contains(output, "workspace") || !strings.Contains(output, "Type /help") {
-		t.Fatalf("expected startup banner, got %q", output)
+	if runner == nil || store == nil || sess == nil {
+		t.Fatal("expected bootstrap to return runner, store, and session")
+	}
+	if sess.Workspace != workspace {
+		t.Fatalf("expected workspace %q, got %q", workspace, sess.Workspace)
+	}
+	if strings.TrimSpace(sess.ID) == "" {
+		t.Fatal("expected session id to be created")
 	}
 }
 
@@ -344,7 +347,7 @@ func TestBootstrapRejectsMissingAPIKey(t *testing.T) {
 		"stream": false,
 	})
 
-	_, _, _, err := bootstrap("", "", "", "", 0, strings.NewReader(""), &bytes.Buffer{})
+	_, _, _, err := bootstrap("", "", "", "", "", 0, strings.NewReader(""), &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("expected missing API key error")
 	}
@@ -357,7 +360,7 @@ func TestBootstrapRejectsExplicitMissingConfigFile(t *testing.T) {
 	workspace := t.TempDir()
 	t.Chdir(workspace)
 
-	_, _, _, err := bootstrap(filepath.Join(workspace, "missing-config.json"), "", "", "", 0, strings.NewReader(""), &bytes.Buffer{})
+	_, _, _, err := bootstrap(filepath.Join(workspace, "missing-config.json"), "", "", "", "", 0, strings.NewReader(""), &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("expected missing config file error")
 	}
@@ -374,7 +377,7 @@ func TestBootstrapRejectsExplicitMalformedConfigFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, _, err := bootstrap(badConfigPath, "", "", "", 0, strings.NewReader(""), &bytes.Buffer{})
+	_, _, _, err := bootstrap(badConfigPath, "", "", "", "", 0, strings.NewReader(""), &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("expected malformed config error")
 	}

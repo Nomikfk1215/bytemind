@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -58,84 +57,21 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 
 	switch args[0] {
 	case "chat":
-		return runChat(args[1:], stdin, stdout, stderr)
+		return runTUI(args[1:], stdin, stdout, stderr)
+	case "tui":
+		return runTUI(args[1:], stdin, stdout, stderr)
 	case "run":
 		return runOneShot(args[1:], stdin, stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return nil
 	default:
-		return runChat(args, stdin, stdout, stderr)
+		return runTUI(args, stdin, stdout, stderr)
 	}
 }
 
 func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("chat", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-
-	configPath := fs.String("config", "", "Path to config file")
-	model := fs.String("model", "", "Override model name")
-	sessionID := fs.String("session", "", "Resume an existing session")
-	streamOverride := fs.String("stream", "", "Override streaming: true or false")
-	maxIterations := fs.Int("max-iterations", 0, "Override execution budget for this run")
-
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	app, store, sess, err := bootstrap(*configPath, *model, *sessionID, *streamOverride, *maxIterations, stdin, stdout)
-	if err != nil {
-		return err
-	}
-
-	fmt.Fprintf(stdout, "%ssession%s %s\n", ansiDim, ansiReset, sess.ID)
-	fmt.Fprintf(stdout, "%sworkspace%s %s\n", ansiDim, ansiReset, sess.Workspace)
-	fmt.Fprintln(stdout, "Type /help for commands, /quit to quit.")
-
-	scanner := bufio.NewScanner(stdin)
-	for {
-		fmt.Fprint(stdout, promptPrefix())
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return err
-			}
-			fmt.Fprintln(stdout)
-			return nil
-		}
-
-		input := strings.TrimSpace(scanner.Text())
-		if input == "" {
-			continue
-		}
-
-		if strings.HasPrefix(input, "/") {
-			completed, suggestions := completeSlashCommand(input)
-			switch {
-			case len(suggestions) > 1:
-				printCommandSuggestions(stdout, input, suggestions)
-				continue
-			case completed != input:
-				fmt.Fprintf(stdout, "%scommand%s %s\n", ansiDim, ansiReset, completed)
-				input = completed
-			}
-
-			nextSess, shouldExit, handled, err := handleSlashCommand(stdout, store, sess, input)
-			if err != nil {
-				return err
-			}
-			if handled {
-				sess = nextSess
-				if shouldExit {
-					return nil
-				}
-				continue
-			}
-		}
-
-		if _, err := app.RunPrompt(context.Background(), sess, input, stdout); err != nil {
-			return err
-		}
-	}
+	return runTUI(args, stdin, stdout, stderr)
 }
 
 func runOneShot(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -147,6 +83,7 @@ func runOneShot(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 	sessionID := fs.String("session", "", "Reuse an existing session")
 	prompt := fs.String("prompt", "", "Prompt to send")
 	streamOverride := fs.String("stream", "", "Override streaming: true or false")
+	workspaceOverride := fs.String("workspace", "", "Workspace to operate on; defaults to current directory")
 	maxIterations := fs.Int("max-iterations", 0, "Override execution budget for this run")
 
 	if err := fs.Parse(args); err != nil {
@@ -160,7 +97,7 @@ func runOneShot(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 		return errors.New("run requires -prompt or trailing prompt text")
 	}
 
-	app, _, sess, err := bootstrap(*configPath, *model, *sessionID, *streamOverride, *maxIterations, stdin, stdout)
+	app, _, sess, err := bootstrap(*configPath, *model, *sessionID, *streamOverride, *workspaceOverride, *maxIterations, stdin, stdout)
 	if err != nil {
 		return err
 	}
@@ -173,8 +110,8 @@ func promptPrefix() string {
 	return "\n" + ansiBlue + "bytemind>" + ansiReset + " "
 }
 
-func bootstrap(configPath, modelOverride, sessionID, streamOverride string, maxIterationsOverride int, stdin io.Reader, stdout io.Writer) (*agent.Runner, *session.Store, *session.Session, error) {
-	workspace, err := os.Getwd()
+func bootstrap(configPath, modelOverride, sessionID, streamOverride, workspaceOverride string, maxIterationsOverride int, stdin io.Reader, stdout io.Writer) (*agent.Runner, *session.Store, *session.Session, error) {
+	workspace, err := resolveWorkspace(workspaceOverride)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -356,33 +293,41 @@ func printCurrentSession(w io.Writer, sess *session.Session) {
 }
 
 func printSessions(w io.Writer, store *session.Store, currentID string, limit int) error {
-	summaries, err := store.List(limit)
+	summaries, warnings, err := store.List(limit)
 	if err != nil {
 		return err
 	}
 	if len(summaries) == 0 {
 		fmt.Fprintln(w, "No saved sessions.")
-		return nil
+	} else {
+		fmt.Fprintf(w, "%srecent sessions%s\n", ansiBold, ansiReset)
+		for _, item := range summaries {
+			marker := " "
+			if item.ID == currentID {
+				marker = "*"
+			}
+			preview := item.LastUserMessage
+			if preview == "" {
+				preview = "(no user prompt yet)"
+			}
+			fmt.Fprintf(w, "%s %s  %s  %2d msgs  %s\n", marker, item.ID, item.UpdatedAt.Local().Format("2006-01-02 15:04"), item.MessageCount, preview)
+			fmt.Fprintf(w, "%s    %s%s\n", ansiGray, item.Workspace, ansiReset)
+		}
 	}
 
-	fmt.Fprintf(w, "%srecent sessions%s\n", ansiBold, ansiReset)
-	for _, item := range summaries {
-		marker := " "
-		if item.ID == currentID {
-			marker = "*"
+	if len(warnings) > 0 {
+		if len(summaries) > 0 {
+			fmt.Fprintln(w)
 		}
-		preview := item.LastUserMessage
-		if preview == "" {
-			preview = "(no user prompt yet)"
+		for _, warning := range warnings {
+			fmt.Fprintf(w, "%swarning%s %s\n", ansiDim, ansiReset, warning)
 		}
-		fmt.Fprintf(w, "%s %s  %s  %2d msgs  %s\n", marker, item.ID, item.UpdatedAt.Local().Format("2006-01-02 15:04"), item.MessageCount, preview)
-		fmt.Fprintf(w, "%s    %s%s\n", ansiGray, item.Workspace, ansiReset)
 	}
 	return nil
 }
 
 func resolveSessionID(store *session.Store, prefix string) (string, error) {
-	summaries, err := store.List(0)
+	summaries, _, err := store.List(0)
 	if err != nil {
 		return "", err
 	}
@@ -431,7 +376,8 @@ func sameWorkspace(a, b string) bool {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "go run ./cmd/bytemind chat [-config path] [-model name] [-session id] [-stream true|false] [-max-iterations n]")
+	fmt.Fprintln(w, "go run ./cmd/bytemind chat [-config path] [-model name] [-session id] [-stream true|false] [-workspace path] [-max-iterations n]")
+	fmt.Fprintln(w, "go run ./cmd/bytemind tui [-config path] [-model name] [-session id] [-stream true|false] [-workspace path] [-max-iterations n]")
 	fmt.Fprintln(w, "go run ./cmd/bytemind run -prompt \"task\" [-config path] [-model name] [-session id] [-stream true|false] [-max-iterations n]")
 }
 
@@ -448,4 +394,11 @@ func commandNames() []string {
 		items = append(items, cmd.Name)
 	}
 	return items
+}
+
+func resolveWorkspace(workspaceOverride string) (string, error) {
+	if strings.TrimSpace(workspaceOverride) == "" {
+		return os.Getwd()
+	}
+	return filepath.Abs(workspaceOverride)
 }
