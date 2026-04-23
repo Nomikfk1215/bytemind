@@ -2366,9 +2366,38 @@ func hasPlanActionChoices(text string) bool {
 	if normalized == "" {
 		return false
 	}
-	hasStart := strings.Contains(normalized, "start execution")
-	hasAdjust := strings.Contains(normalized, "adjust plan")
+	hasStart := containsAnyPlanActionToken(normalized,
+		"start execution",
+		"continue execution",
+		"开始执行",
+		"继续执行",
+		"开始构建",
+		"执行",
+	)
+	hasAdjust := containsAnyPlanActionToken(normalized,
+		"adjust plan",
+		"continue plan",
+		"refine plan",
+		"keep refining",
+		"调整计划",
+		"继续规划",
+		"继续计划",
+		"完善计划",
+	)
 	return hasStart && hasAdjust
+}
+
+func containsAnyPlanActionToken(input string, tokens ...string) bool {
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if strings.Contains(input, strings.ToLower(token)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m model) currentPhaseLabel() string {

@@ -1676,6 +1676,30 @@ func TestResolvePlanActionSelectionSupportsOptionChoices(t *testing.T) {
 	}
 }
 
+func TestResolvePlanActionSelectionSupportsLocalizedOptionChoices(t *testing.T) {
+	sess := session.New("E:\\bytemind")
+	sess.Messages = append(sess.Messages, llm.NewAssistantTextMessage(strings.Join([]string{
+		"请选择下一步：",
+		"1. 开始执行",
+		"2. 调整计划",
+	}, "\n")))
+	state := planpkg.State{
+		Goal:                "Finish plan mode",
+		Phase:               planpkg.PhaseReady,
+		Steps:               []planpkg.Step{{Title: "Implement continuation", Status: planpkg.StepPending}},
+		ScopeDefined:        true,
+		RiskRollbackDefined: true,
+		VerificationDefined: true,
+	}
+
+	if got, ok := resolvePlanActionSelection("1", state, sess); !ok || got != "start execution" {
+		t.Fatalf("expected option 1 to resolve to start execution, got %q ok=%v", got, ok)
+	}
+	if got, ok := resolvePlanActionSelection("2", state, sess); !ok || got != "adjust plan" {
+		t.Fatalf("expected option 2 to resolve to adjust plan, got %q ok=%v", got, ok)
+	}
+}
+
 func TestResolvePlanActionSelectionDoesNotHijackClarifyAnswers(t *testing.T) {
 	sess := session.New("E:\\bytemind")
 	sess.Messages = append(sess.Messages, llm.NewAssistantTextMessage(strings.Join([]string{
