@@ -31,10 +31,13 @@ func shouldRepairBuildHandoffTurn(runMode planpkg.AgentMode, state planpkg.State
 	if text == "" || intent == turnIntentContinueWork {
 		return false
 	}
+	if looksLikeLegitimateExecutionBlocker(text) {
+		return false
+	}
 	if looksLikeRedundantBuildHandoffBlocker(text) {
 		return true
 	}
-	return intent == turnIntentAskUser || intent == turnIntentFinalize
+	return looksLikeModeConfusionWithoutExecutionBlocker(text, intent)
 }
 
 func buildBuildHandoffRepairInstruction(state planpkg.State, reply llm.Message, latestUser string, attempt, maxAttempts int) string {
@@ -134,4 +137,50 @@ func looksLikeRedundantBuildHandoffBlocker(text string) bool {
 	}
 	return hasAskUserSignal(normalized) &&
 		containsAnyToken(normalized, "continue execution", "start execution", "switch to build", "build mode", "继续执行", "开始执行")
+}
+
+func looksLikeLegitimateExecutionBlocker(text string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	if normalized == "" {
+		return false
+	}
+	if containsAnyToken(normalized,
+		"approval", "permission denied", "requires approval", "needs approval", "access denied",
+		"api key", "apikey", "token", "credential", "credentials", "secret", "auth", "authentication",
+		"env", "environment variable", "config", "configuration", "path", "repo", "repository",
+		"missing", "not found", "cannot access", "unable to access", "please provide", "need", "required",
+		"需要批准", "无权限", "权限不足", "批准",
+		"凭据", "密钥", "令牌", "token", "api key", "环境变量", "配置", "路径", "仓库",
+		"缺少", "未找到", "无法访问", "请提供", "需要", "必需",
+	) {
+		return true
+	}
+	return hasAskUserSignal(normalized) &&
+		containsAnyToken(normalized, "provide", "missing", "required", "api", "token", "credential", "env", "path", "repo", "请提供", "缺少", "需要")
+}
+
+func looksLikeModeConfusionWithoutExecutionBlocker(text string, intent assistantTurnIntent) bool {
+	if intent != turnIntentAskUser && intent != turnIntentFinalize {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	if normalized == "" || looksLikeLegitimateExecutionBlocker(normalized) {
+		return false
+	}
+	return containsAnyToken(normalized,
+		"plan confirmation",
+		"still in plan",
+		"stuck in plan",
+		"switch to build",
+		"build mode",
+		"continue execution",
+		"start execution",
+		"计划确认",
+		"仍停在计划",
+		"卡在计划",
+		"切到 build",
+		"切换到 build",
+		"继续执行",
+		"开始执行",
+	)
 }
