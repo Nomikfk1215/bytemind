@@ -2,18 +2,31 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
+	"time"
 
 	"bytemind/internal/config"
+	extensionspkg "bytemind/internal/extensions"
 	"bytemind/internal/llm"
+	"bytemind/internal/provider"
+	runtimepkg "bytemind/internal/runtime"
 	"bytemind/internal/session"
+	"bytemind/internal/skills"
+	storagepkg "bytemind/internal/storage"
+	"bytemind/internal/tokenusage"
 	"bytemind/internal/tools"
 )
 
-const repeatedToolSequenceThreshold = 3
+const (
+	maxActiveSkillDescriptionChars  = 320
+	maxActiveSkillInstructionsChars = 3600
+	emptyReplyFallback              = "Model returned an empty response (no text and no tool calls). Retry the request or switch model if this persists."
+	skillAuthorEnglishFallback      = "Describe the skill goals, workflow, and expected output in concise English."
+	skillAuthorTranslatePrompt      = "Translate the user's skill description into concise English for backend metadata. Return only plain English text with no markdown or quotes."
+)
 
 const (
 	ansiReset   = "\x1b[0m"
@@ -27,448 +40,277 @@ const (
 )
 
 type Options struct {
-	Workspace string
-	Config    config.Config
-	Client    llm.Client
-	Store     *session.Store
-	Registry  *tools.Registry
-	Stdin     io.Reader
-	Stdout    io.Writer
+	Workspace     string
+	Config        config.Config
+	Client        llm.Client
+	Store         SessionStore
+	Registry      ToolRegistry
+	Executor      ToolExecutor
+	PolicyGateway PolicyGateway
+	Engine        Engine
+	TaskManager   runtimepkg.TaskManager
+	Runtime       RuntimeGateway
+	Extensions    extensionspkg.Manager
+	SkillManager  *skills.Manager
+	TokenManager  *tokenusage.TokenUsageManager
+	AuditStore    storagepkg.AuditStore
+	PromptStore   storagepkg.PromptHistoryWriter
+	Observer      Observer
+	Approval      tools.ApprovalHandler
+	Stdin         io.Reader
+	Stdout        io.Writer
+}
+
+type RunPromptInput struct {
+	UserMessage llm.Message
+	Assets      map[llm.AssetID]llm.ImageAsset
+	DisplayText string
 }
 
 type Runner struct {
-	workspace string
-	config    config.Config
-	client    llm.Client
-	store     *session.Store
-	registry  *tools.Registry
-	stdin     io.Reader
-	stdout    io.Writer
+	workspace     string
+	config        config.Config
+	client        llm.Client
+	store         SessionStore
+	registry      ToolRegistry
+	executor      ToolExecutor
+	policyGateway PolicyGateway
+	engine        Engine
+	taskManager   runtimepkg.TaskManager
+	runtime       RuntimeGateway
+	extensions    extensionspkg.Manager
+	skillManager  *skills.Manager
+	tokenManager  *tokenusage.TokenUsageManager
+	auditStore    storagepkg.AuditStore
+	promptStore   storagepkg.PromptHistoryWriter
+	observer      Observer
+	approval      tools.ApprovalHandler
+	stdin         io.Reader
+	stdout        io.Writer
+
+	bridgeMu            sync.Mutex
+	bridgeSessions      map[string]bridgeSessionState
+	bridgeSessionTurns  map[string]int
+	bridgeToolRefCounts map[string]int
+
+	extensionSyncMu    sync.Mutex
+	extensionSyncTTL   time.Duration
+	extensionSyncAt    time.Time
+	extensionSyncDirty bool
+	extensionSyncGen   uint64
+	extensionToolKeys  map[string]map[string]struct{}
 }
 
 func NewRunner(opts Options) *Runner {
-	return &Runner{
-		workspace: opts.Workspace,
-		config:    opts.Config,
-		client:    opts.Client,
-		store:     opts.Store,
-		registry:  opts.Registry,
-		stdin:     opts.Stdin,
-		stdout:    opts.Stdout,
+	cfg := opts.Config
+	if model := strings.TrimSpace(cfg.ProviderRuntime.DefaultModel); model != "" {
+		cfg.Provider.Model = model
 	}
+
+	manager := opts.SkillManager
+	if manager == nil {
+		manager = skills.NewManager(opts.Workspace)
+	}
+	registry := opts.Registry
+	if registry == nil {
+		registry = tools.DefaultRegistry()
+	}
+	executor := opts.Executor
+	if executor == nil {
+		if concrete, ok := registry.(*tools.Registry); ok {
+			executor = tools.NewExecutor(concrete)
+		}
+	}
+	policyGateway := opts.PolicyGateway
+	if policyGateway == nil {
+		policyGateway = NewDefaultPolicyGateway()
+	}
+	auditStore := opts.AuditStore
+	if auditStore == nil {
+		auditStore = storagepkg.NopAuditStore{}
+	}
+	promptStore := opts.PromptStore
+	if promptStore == nil {
+		promptStore = storagepkg.NopPromptHistoryStore{}
+	}
+	taskManager := opts.TaskManager
+	if taskManager == nil {
+		taskManager = runtimepkg.NewInMemoryTaskManager()
+	}
+	runtimeGateway := opts.Runtime
+	if runtimeGateway == nil {
+		runtimeGateway = newDefaultRuntimeGateway(taskManager)
+	}
+	extensions := opts.Extensions
+	if extensions == nil {
+		extensions = extensionspkg.NopManager{}
+	}
+	extensionSyncTTL := time.Duration(cfg.MCP.SyncTTLSeconds) * time.Second
+	if extensionSyncTTL <= 0 {
+		extensionSyncTTL = 30 * time.Second
+	}
+	client := opts.Client
+	if client != nil {
+		client = routeAwareClient{base: client}
+	}
+	runner := &Runner{
+		workspace:     opts.Workspace,
+		config:        cfg,
+		client:        client,
+		store:         opts.Store,
+		registry:      registry,
+		executor:      executor,
+		policyGateway: policyGateway,
+		taskManager:   taskManager,
+		runtime:       runtimeGateway,
+		extensions:    extensions,
+		skillManager:  manager,
+		tokenManager:  opts.TokenManager,
+		auditStore:    auditStore,
+		promptStore:   promptStore,
+		observer:      opts.Observer,
+		approval:      opts.Approval,
+		stdin:         opts.Stdin,
+		stdout:        opts.Stdout,
+
+		extensionSyncTTL:   extensionSyncTTL,
+		extensionSyncDirty: true,
+		extensionToolKeys:  map[string]map[string]struct{}{},
+	}
+
+	engine := opts.Engine
+	if engine == nil {
+		engine = NewDefaultEngine(runner)
+	}
+	runner.engine = engine
+
+	return runner
 }
 
-func (r *Runner) RunPrompt(ctx context.Context, sess *session.Session, userInput string, out io.Writer) (string, error) {
-	sess.Messages = append(sess.Messages, llm.Message{
-		Role:    "user",
-		Content: userInput,
-	})
-	if err := r.store.Save(sess); err != nil {
-		return "", err
-	}
-
-	lastToolSequenceSignature := ""
-	repeatedToolSequenceCount := 0
-	executedToolNames := make([]string, 0, 16)
-
-	for step := 0; step < r.config.MaxIterations; step++ {
-		messages := make([]llm.Message, 0, len(sess.Messages)+1)
-		messages = append(messages, llm.Message{
-			Role:    "system",
-			Content: systemPrompt(r.workspace, r.config.ApprovalPolicy),
-		})
-		messages = append(messages, sess.Messages...)
-
-		request := llm.ChatRequest{
-			Model:       r.config.Provider.Model,
-			Messages:    messages,
-			Tools:       r.registry.Definitions(),
-			Temperature: 0.2,
-		}
-
-		streamedText := false
-		reply, err := r.completeTurn(ctx, request, out, &streamedText)
-		if err != nil {
-			return "", err
-		}
-
-		if len(reply.ToolCalls) == 0 {
-			sess.Messages = append(sess.Messages, reply)
-			if err := r.store.Save(sess); err != nil {
-				return "", err
-			}
-
-			answer := strings.TrimSpace(reply.Content)
-			if answer == "" {
-				return "", fmt.Errorf("assistant returned neither content nor tool calls")
-			}
-			if out != nil && !streamedText {
-				fmt.Fprintln(out)
-				fmt.Fprintln(out, answer)
-			}
-			return answer, nil
-		}
-
-		toolSequenceSignature := signatureToolCalls(reply.ToolCalls)
-		if toolSequenceSignature == lastToolSequenceSignature {
-			repeatedToolSequenceCount++
-		} else {
-			lastToolSequenceSignature = toolSequenceSignature
-			repeatedToolSequenceCount = 1
-		}
-		if repeatedToolSequenceCount >= repeatedToolSequenceThreshold {
-			summary := r.buildStopSummary(
-				sess,
-				fmt.Sprintf("I stopped because the assistant repeated the same tool sequence %d times in a row (%s).", repeatedToolSequenceCount, strings.Join(uniqueToolCallNames(reply.ToolCalls), ", ")),
-				executedToolNames,
-			)
-			return r.finishWithSummary(sess, summary, out, streamedText)
-		}
-
-		sess.Messages = append(sess.Messages, reply)
-		if err := r.store.Save(sess); err != nil {
-			return "", err
-		}
-
-		if streamedText && out != nil {
-			fmt.Fprintln(out)
-		}
-		for _, call := range reply.ToolCalls {
-			executedToolNames = append(executedToolNames, call.Function.Name)
-			if out != nil {
-				fmt.Fprintf(out, "%s%stool>%s %s\n", ansiBold, ansiCyan, ansiReset, call.Function.Name)
-			}
-
-			result, execErr := r.registry.Execute(ctx, call.Function.Name, call.Function.Arguments, &tools.ExecutionContext{
-				Workspace:      r.workspace,
-				ApprovalPolicy: r.config.ApprovalPolicy,
-				Session:        sess,
-				Stdin:          r.stdin,
-				Stdout:         r.stdout,
-			})
-			if execErr != nil {
-				result = marshalToolResult(map[string]any{
-					"ok":    false,
-					"error": execErr.Error(),
-				})
-			}
-			if out != nil {
-				r.renderToolFeedback(out, call.Function.Name, result)
-			}
-
-			sess.Messages = append(sess.Messages, llm.Message{
-				Role:       "tool",
-				ToolCallID: call.ID,
-				Content:    result,
-			})
-			if err := r.store.Save(sess); err != nil {
-				return "", err
-			}
-		}
-	}
-
-	summary := r.buildStopSummary(
-		sess,
-		fmt.Sprintf("I reached the current execution budget of %d turns before producing a final answer.", r.config.MaxIterations),
-		executedToolNames,
-	)
-	return r.finishWithSummary(sess, summary, out, false)
-}
-
-func (r *Runner) completeTurn(ctx context.Context, request llm.ChatRequest, out io.Writer, streamedText *bool) (llm.Message, error) {
-	if !r.config.Stream {
-		return r.client.CreateMessage(ctx, request)
-	}
-
-	return r.client.StreamMessage(ctx, request, func(delta string) {
-		if out == nil || delta == "" {
-			return
-		}
-		if !*streamedText {
-			fmt.Fprintln(out)
-		}
-		*streamedText = true
-		fmt.Fprint(out, delta)
-	})
-}
-
-func (r *Runner) renderToolFeedback(out io.Writer, name, payload string) {
-	var envelope struct {
-		OK    *bool  `json:"ok"`
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(payload), &envelope); err == nil && envelope.Error != "" {
-		fmt.Fprintf(out, "  %serror%s %s\n\n", ansiRed, ansiReset, envelope.Error)
-		return
-	}
-
-	switch name {
-	case "list_files":
-		var result struct {
-			Root  string `json:"root"`
-			Items []struct {
-				Path string `json:"path"`
-				Type string `json:"type"`
-			} `json:"items"`
-		}
-		if err := json.Unmarshal([]byte(payload), &result); err == nil {
-			fmt.Fprintf(out, "  %slisted%s %d entries under %s\n", ansiGreen, ansiReset, len(result.Items), emptyDot(result.Root))
-			for _, item := range previewPaths(result.Items) {
-				fmt.Fprintf(out, "    %s\n", item)
-			}
-		}
-	case "read_file":
-		var result struct {
-			Path       string `json:"path"`
-			StartLine  int    `json:"start_line"`
-			EndLine    int    `json:"end_line"`
-			TotalLines int    `json:"total_lines"`
-			Content    string `json:"content"`
-		}
-		if err := json.Unmarshal([]byte(payload), &result); err == nil {
-			shown := 0
-			if strings.TrimSpace(result.Content) != "" && result.EndLine >= result.StartLine {
-				shown = result.EndLine - result.StartLine + 1
-			}
-			fmt.Fprintf(out, "  %sread%s %s lines %d-%d of %d (%d shown)\n", ansiGreen, ansiReset, result.Path, result.StartLine, result.EndLine, result.TotalLines, shown)
-		}
-	case "search_text":
-		var result struct {
-			Query   string `json:"query"`
-			Matches []struct {
-				Path string `json:"path"`
-				Line int    `json:"line"`
-				Text string `json:"text"`
-			} `json:"matches"`
-		}
-		if err := json.Unmarshal([]byte(payload), &result); err == nil {
-			fmt.Fprintf(out, "  %sfound%s %d matches for %q\n", ansiGreen, ansiReset, len(result.Matches), result.Query)
-			for _, match := range previewMatches(result.Matches) {
-				fmt.Fprintf(out, "    %s\n", match)
-			}
-		}
-	case "write_file":
-		var result struct {
-			Path         string `json:"path"`
-			BytesWritten int    `json:"bytes_written"`
-		}
-		if err := json.Unmarshal([]byte(payload), &result); err == nil {
-			fmt.Fprintf(out, "  %swrote%s %s (%d bytes)\n", ansiGreen, ansiReset, result.Path, result.BytesWritten)
-		}
-	case "replace_in_file":
-		var result struct {
-			Path     string `json:"path"`
-			Replaced int    `json:"replaced"`
-			OldCount int    `json:"old_count"`
-		}
-		if err := json.Unmarshal([]byte(payload), &result); err == nil {
-			fmt.Fprintf(out, "  %supdated%s %s (%d/%d matches replaced)\n", ansiGreen, ansiReset, result.Path, result.Replaced, result.OldCount)
-		}
-	case "run_shell":
-		var result struct {
-			OK       bool   `json:"ok"`
-			ExitCode int    `json:"exit_code"`
-			Stdout   string `json:"stdout"`
-			Stderr   string `json:"stderr"`
-		}
-		if err := json.Unmarshal([]byte(payload), &result); err == nil {
-			statusColor := ansiGreen
-			if !result.OK {
-				statusColor = ansiYellow
-			}
-			fmt.Fprintf(out, "  %sexit%s code %d\n", statusColor, ansiReset, result.ExitCode)
-			for _, line := range previewOutput("stdout", result.Stdout) {
-				fmt.Fprintf(out, "    %s\n", line)
-			}
-			for _, line := range previewOutput("stderr", result.Stderr) {
-				fmt.Fprintf(out, "    %s\n", line)
-			}
-		}
-	case "apply_patch":
-		var result struct {
-			Operations []struct {
-				Type string `json:"type"`
-				Path string `json:"path"`
-			} `json:"operations"`
-		}
-		if err := json.Unmarshal([]byte(payload), &result); err == nil {
-			fmt.Fprintf(out, "  %spatch%s %d operations\n", ansiGreen, ansiReset, len(result.Operations))
-			for _, op := range result.Operations {
-				fmt.Fprintf(out, "    %s %s\n", op.Type, op.Path)
-			}
-		}
-	default:
-		fmt.Fprintf(out, "  %scompleted%s\n", ansiDim, ansiReset)
-	}
-	fmt.Fprintln(out)
-}
-
-func (r *Runner) finishWithSummary(sess *session.Session, summary string, out io.Writer, streamedText bool) (string, error) {
-	sess.Messages = append(sess.Messages, llm.Message{
-		Role:    "assistant",
-		Content: summary,
-	})
-	if err := r.store.Save(sess); err != nil {
-		return "", err
-	}
-	if out != nil {
-		if streamedText {
-			fmt.Fprintln(out)
-		}
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, summary)
-	}
-	return summary, nil
-}
-
-func (r *Runner) buildStopSummary(sess *session.Session, reason string, executedToolNames []string) string {
-	var builder strings.Builder
-	builder.WriteString("Paused before a final answer.\n")
-	builder.WriteString(reason)
-
-	recentTools := recentToolNames(executedToolNames, 4)
-	if len(recentTools) > 0 {
-		builder.WriteString("\nRecent tool activity:\n")
-		for _, toolName := range recentTools {
-			fmt.Fprintf(&builder, "- %s\n", toolName)
-		}
-	}
-
-	fmt.Fprintf(&builder, "\nYou can continue by reusing session %s with -session %s, or raise the budget with -max-iterations <n>.", sess.ID, sess.ID)
-	return builder.String()
-}
-
-func signatureToolCalls(calls []llm.ToolCall) string {
-	parts := make([]string, 0, len(calls))
-	for _, call := range calls {
-		parts = append(parts, call.Function.Name+":"+normalizeToolArguments(call.Function.Arguments))
-	}
-	return strings.Join(parts, "|")
-}
-
-func normalizeToolArguments(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "{}"
-	}
-	var value any
-	if err := json.Unmarshal([]byte(raw), &value); err != nil {
-		return raw
-	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return raw
-	}
-	return string(data)
-}
-
-func uniqueToolCallNames(calls []llm.ToolCall) []string {
-	seen := make(map[string]struct{}, len(calls))
-	result := make([]string, 0, len(calls))
-	for _, call := range calls {
-		if _, ok := seen[call.Function.Name]; ok {
-			continue
-		}
-		seen[call.Function.Name] = struct{}{}
-		result = append(result, call.Function.Name)
-	}
-	return result
-}
-
-func recentToolNames(names []string, limit int) []string {
-	if limit <= 0 || len(names) == 0 {
+func (r *Runner) GetClient() llm.Client {
+	if r == nil {
 		return nil
 	}
-	result := make([]string, 0, limit)
-	seen := map[string]struct{}{}
-	for i := len(names) - 1; i >= 0 && len(result) < limit; i-- {
-		name := names[i]
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		result = append(result, name)
+	if wrapped, ok := r.client.(routeAwareClient); ok {
+		return wrapped.base
 	}
-	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
-		result[i], result[j] = result[j], result[i]
-	}
-	return result
+	return r.client
 }
 
-func marshalToolResult(v any) string {
-	data, err := json.Marshal(v)
+func (r *Runner) GetConfig() config.Config {
+	if r == nil {
+		return config.Config{}
+	}
+	return r.config
+}
+
+func (r *Runner) modelID() string {
+	if r == nil {
+		return ""
+	}
+	if model := strings.TrimSpace(r.config.ProviderRuntime.DefaultModel); model != "" {
+		return model
+	}
+	return strings.TrimSpace(r.config.Provider.Model)
+}
+
+type routeAwareClient struct {
+	base llm.Client
+}
+
+func (c routeAwareClient) CreateMessage(ctx context.Context, request llm.ChatRequest) (llm.Message, error) {
+	return c.base.CreateMessage(mergeAllowFallbackRouteContext(ctx), request)
+}
+
+func (c routeAwareClient) StreamMessage(ctx context.Context, request llm.ChatRequest, onDelta func(string)) (llm.Message, error) {
+	return c.base.StreamMessage(mergeAllowFallbackRouteContext(ctx), request, onDelta)
+}
+
+func mergeAllowFallbackRouteContext(ctx context.Context) context.Context {
+	rc := provider.RouteContextFromContext(ctx)
+	rc.AllowFallback = true
+	return provider.WithRouteContext(ctx, rc)
+}
+
+func (r *Runner) RunPrompt(ctx context.Context, sess *session.Session, userInput, mode string, out io.Writer) (string, error) {
+	return r.RunPromptWithInput(ctx, sess, RunPromptInput{
+		UserMessage: llm.NewUserTextMessage(userInput),
+		DisplayText: userInput,
+	}, mode, out)
+}
+
+func (r *Runner) RunPromptWithInput(ctx context.Context, sess *session.Session, input RunPromptInput, mode string, out io.Writer) (string, error) {
+	if r.engine == nil {
+		return "", fmt.Errorf("agent engine is unavailable")
+	}
+
+	events, err := r.engine.HandleTurn(ctx, TurnRequest{
+		Session: sess,
+		Input:   input,
+		Mode:    mode,
+		Out:     out,
+	})
 	if err != nil {
-		return `{"ok":false,"error":"failed to encode tool result"}`
+		return "", err
 	}
-	return string(data)
-}
+	if events == nil {
+		return "", fmt.Errorf("engine returned nil event stream")
+	}
 
-func emptyDot(path string) string {
-	if strings.TrimSpace(path) == "" {
-		return "."
-	}
-	return path
-}
-
-func previewPaths(items []struct {
-	Path string `json:"path"`
-	Type string `json:"type"`
-}) []string {
-	limit := toolPreview
-	if len(items) < limit {
-		limit = len(items)
-	}
-	result := make([]string, 0, limit)
-	for i := 0; i < limit; i++ {
-		prefix := "file"
-		if items[i].Type == "dir" {
-			prefix = "dir "
+	handleEvent := func(event TurnEvent) (string, error, bool) {
+		switch event.Type {
+		case TurnEventCompleted:
+			return event.Answer, nil, true
+		case TurnEventFailed:
+			if event.Error != nil {
+				return "", event.Error, true
+			}
+			return "", fmt.Errorf("agent turn failed"), true
+		default:
+			return "", nil, false
 		}
-		result = append(result, prefix+" "+items[i].Path)
 	}
-	return result
-}
 
-func previewMatches(matches []struct {
-	Path string `json:"path"`
-	Line int    `json:"line"`
-	Text string `json:"text"`
-}) []string {
-	limit := toolPreview
-	if len(matches) < limit {
-		limit = len(matches)
-	}
-	result := make([]string, 0, limit)
-	for i := 0; i < limit; i++ {
-		result = append(result, fmt.Sprintf("%s:%d %s", matches[i].Path, matches[i].Line, compactWhitespace(matches[i].Text, 80)))
-	}
-	return result
-}
+	for {
+		// Prefer already-ready engine events (especially terminal ones) over cancellation.
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return "", fmt.Errorf("engine ended without terminal event")
+			}
+			answer, eventErr, done := handleEvent(event)
+			if done {
+				return answer, eventErr
+			}
+			continue
+		default:
+		}
 
-func previewOutput(label, text string) []string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return nil
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return "", fmt.Errorf("engine ended without terminal event")
+			}
+			answer, eventErr, done := handleEvent(event)
+			if done {
+				return answer, eventErr
+			}
+		case <-ctx.Done():
+			// If cancellation races with terminal events, prefer already-ready terminal events.
+			for {
+				select {
+				case event, ok := <-events:
+					if !ok {
+						return "", ctx.Err()
+					}
+					answer, eventErr, done := handleEvent(event)
+					if done {
+						return answer, eventErr
+					}
+				default:
+					return "", ctx.Err()
+				}
+			}
+		}
 	}
-	lines := strings.Split(text, "\n")
-	limit := toolPreview
-	if len(lines) < limit {
-		limit = len(lines)
-	}
-	result := make([]string, 0, limit)
-	for i := 0; i < limit; i++ {
-		result = append(result, fmt.Sprintf("%s: %s", label, compactWhitespace(lines[i], 120)))
-	}
-	return result
-}
-
-func compactWhitespace(text string, limit int) string {
-	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-	if limit <= 0 || len(text) <= limit {
-		return text
-	}
-	if limit <= 3 {
-		return text[:limit]
-	}
-	return text[:limit-3] + "..."
 }

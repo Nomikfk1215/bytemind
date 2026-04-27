@@ -1,39 +1,88 @@
 package session
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"bytemind/internal/llm"
+	planpkg "bytemind/internal/plan"
+	storagepkg "bytemind/internal/storage"
 )
 
+type ActiveSkill struct {
+	Name        string            `json:"name"`
+	Args        map[string]string `json:"args,omitempty"`
+	ActivatedAt time.Time         `json:"activated_at,omitempty"`
+}
+
 type Session struct {
-	ID        string        `json:"id"`
-	Workspace string        `json:"workspace"`
-	CreatedAt time.Time     `json:"created_at"`
-	UpdatedAt time.Time     `json:"updated_at"`
-	Messages  []llm.Message `json:"messages"`
+	ID           string            `json:"id"`
+	Workspace    string            `json:"workspace"`
+	Title        string            `json:"title,omitempty"`
+	CreatedAt    time.Time         `json:"created_at"`
+	UpdatedAt    time.Time         `json:"updated_at"`
+	Conversation Conversation      `json:"conversation,omitempty"`
+	Messages     []llm.Message     `json:"messages,omitempty"`
+	Mode         planpkg.AgentMode `json:"mode,omitempty"`
+	Plan         planpkg.State     `json:"plan,omitempty"`
+	ActiveSkill  *ActiveSkill      `json:"active_skill,omitempty"`
+}
+
+type Conversation struct {
+	Meta     ConversationMeta   `json:"meta,omitempty"`
+	Timeline []llm.Message      `json:"timeline"`
+	Assets   ConversationAssets `json:"assets,omitempty"`
+}
+
+type ConversationMeta map[string]any
+
+type ConversationAssets struct {
+	Images map[llm.AssetID]ImageAssetMeta `json:"images,omitempty"`
+}
+
+type ImageAssetMeta struct {
+	ImageID   int    `json:"image_id"`
+	MediaType string `json:"media_type"`
+	FileName  string `json:"file_name,omitempty"`
+	CachePath string `json:"cache_path"`
+	ByteSize  int64  `json:"byte_size"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
 }
 
 type Store struct {
-	dir string
+	files  *storagepkg.SessionFileStore
+	locker storagepkg.Locker
+
+	mu             sync.Mutex
+	recentEventIDs map[string]*eventIDWindow
+
+	now            func() time.Time
+	newEventID     func() string
+	lockTimeout    time.Duration
+	snapshotEveryN int64
+	snapshotEveryT time.Duration
 }
 
 type Summary struct {
-	ID              string    `json:"id"`
-	Workspace       string    `json:"workspace"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
-	LastUserMessage string    `json:"last_user_message,omitempty"`
-	MessageCount    int       `json:"message_count"`
+	ID                            string    `json:"id"`
+	Workspace                     string    `json:"workspace"`
+	Title                         string    `json:"title,omitempty"`
+	Preview                       string    `json:"preview,omitempty"`
+	CreatedAt                     time.Time `json:"created_at"`
+	UpdatedAt                     time.Time `json:"updated_at"`
+	LastUserMessage               string    `json:"last_user_message,omitempty"`
+	MessageCount                  int       `json:"message_count"`
+	RawMessageCount               int       `json:"raw_msg_count"`
+	UserEffectiveInputCount       int       `json:"user_effective_input_count"`
+	AssistantEffectiveOutputCount int       `json:"assistant_effective_output_count"`
+	ZeroMsgSession                bool      `json:"zero_msg_session"`
+	NoReplySession                bool      `json:"no_reply_session"`
 }
 
 func New(workspace string) *Session {
@@ -43,146 +92,51 @@ func New(workspace string) *Session {
 		Workspace: workspace,
 		CreatedAt: now,
 		UpdatedAt: now,
-		Messages:  make([]llm.Message, 0, 32),
+		Conversation: Conversation{
+			Timeline: make([]llm.Message, 0, 32),
+		},
+		Messages: make([]llm.Message, 0, 32),
+		Mode:     planpkg.ModeBuild,
+		Plan: planpkg.State{
+			Phase: planpkg.PhaseNone,
+			Steps: make([]planpkg.Step, 0, 8),
+		},
 	}
 }
 
 func NewStore(dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	files, err := storagepkg.NewSessionFileStore(dir)
+	if err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir}, nil
-}
-
-func (s *Store) Save(session *Session) error {
-	session.UpdatedAt = time.Now().UTC()
-	var buf bytes.Buffer
-	encoder := json.NewEncoder(&buf)
-	encoder.SetEscapeHTML(false)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(session); err != nil {
-		return err
-	}
-
-	target := filepath.Join(s.dir, session.ID+".json")
-	tmp, err := os.CreateTemp(s.dir, session.ID+".*.tmp")
+	locker, err := storagepkg.NewDefaultLocker(filepath.Join(dir, ".locks"))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	if err := tmp.Chmod(0o644); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(bytes.TrimRight(buf.Bytes(), "\n")); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, target); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
+	return &Store{
+		files:          files,
+		locker:         locker,
+		recentEventIDs: make(map[string]*eventIDWindow),
+		now: func() time.Time {
+			return time.Now().UTC()
+		},
+		newEventID: func() string {
+			var entropy [8]byte
+			if _, err := rand.Read(entropy[:]); err != nil {
+				return fmt.Sprintf("evt-%d", time.Now().UTC().UnixNano())
+			}
+			return "evt-" + hex.EncodeToString(entropy[:])
+		},
+		lockTimeout:    5 * time.Second,
+		snapshotEveryN: defaultSnapshotEveryN,
+		snapshotEveryT: defaultSnapshotEveryT,
+	}, nil
 }
 
 func (s *Store) Load(id string) (*Session, error) {
-	data, err := os.ReadFile(filepath.Join(s.dir, id+".json"))
-	if err != nil {
-		return nil, err
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, fmt.Errorf("session id is required")
 	}
-	var session Session
-	if err := json.Unmarshal(data, &session); err != nil {
-		return nil, err
-	}
-	return &session, nil
-}
-
-func (s *Store) List(limit int) ([]Summary, []string, error) {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	summaries := make([]Summary, 0, len(entries))
-	warnings := make([]string, 0)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-
-		data, err := os.ReadFile(filepath.Join(s.dir, entry.Name()))
-		if err != nil {
-			return nil, nil, err
-		}
-		if len(bytes.TrimSpace(data)) == 0 {
-			warnings = append(warnings, fmt.Sprintf("skipped corrupted session file %s: empty file", entry.Name()))
-			continue
-		}
-
-		var sess Session
-		if err := json.Unmarshal(data, &sess); err != nil {
-			warnings = append(warnings, fmt.Sprintf("skipped corrupted session file %s: invalid JSON (%v)", entry.Name(), err))
-			continue
-		}
-
-		summaries = append(summaries, Summary{
-			ID:              sess.ID,
-			Workspace:       sess.Workspace,
-			CreatedAt:       sess.CreatedAt,
-			UpdatedAt:       sess.UpdatedAt,
-			LastUserMessage: summarizeMessage(lastUserMessage(sess.Messages), 72),
-			MessageCount:    len(sess.Messages),
-		})
-	}
-
-	sort.Slice(summaries, func(i, j int) bool {
-		return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
-	})
-
-	if limit > 0 && len(summaries) > limit {
-		summaries = summaries[:limit]
-	}
-	return summaries, warnings, nil
-}
-
-func newID() string {
-	buf := make([]byte, 4)
-	if _, err := rand.Read(buf); err != nil {
-		return time.Now().UTC().Format("20060102-150405")
-	}
-	return time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(buf)
-}
-
-func lastUserMessage(messages []llm.Message) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			return messages[i].Content
-		}
-	}
-	return ""
-}
-
-func summarizeMessage(text string, limit int) string {
-	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-	if limit <= 0 || len(text) <= limit {
-		return text
-	}
-	if limit <= 3 {
-		return text[:limit]
-	}
-	return text[:limit-3] + "..."
+	return s.load(id)
 }

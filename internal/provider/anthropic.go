@@ -3,8 +3,8 @@ package provider
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -38,7 +38,10 @@ func NewAnthropic(cfg Config) *Anthropic {
 }
 
 func (c *Anthropic) CreateMessage(ctx context.Context, req llm.ChatRequest) (llm.Message, error) {
-	system, messages := anthropicMessages(req.Messages)
+	system, messages, err := anthropicMessages(req)
+	if err != nil {
+		return llm.Message{}, err
+	}
 	payload := map[string]any{
 		"model":       choose(req.Model, c.model),
 		"max_tokens":  4096,
@@ -76,40 +79,66 @@ func (c *Anthropic) CreateMessage(ctx context.Context, req llm.ChatRequest) (llm
 		return llm.Message{}, err
 	}
 	if resp.StatusCode >= 300 {
-		return llm.Message{}, fmt.Errorf("provider error %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return llm.Message{}, llm.MapProviderError("anthropic", resp.StatusCode, string(respBody), nil)
 	}
 
 	var completion struct {
 		Content []struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text"`
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
+			Type     string          `json:"type"`
+			Text     string          `json:"text"`
+			ID       string          `json:"id"`
+			Name     string          `json:"name"`
+			Input    json.RawMessage `json:"input"`
+			Thinking string          `json:"thinking"`
 		} `json:"content"`
+		Usage struct {
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(respBody, &completion); err != nil {
 		return llm.Message{}, err
 	}
 
-	message := llm.Message{Role: "assistant"}
+	message := llm.Message{Role: llm.RoleAssistant}
 	for _, block := range completion.Content {
 		switch block.Type {
 		case "text":
-			message.Content += block.Text
+			message.AppendPart(llm.Part{Type: llm.PartText, Text: &llm.TextPart{Value: block.Text}})
 		case "tool_use":
 			arguments := "{}"
 			if len(block.Input) > 0 {
 				arguments = string(block.Input)
 			}
-			message.ToolCalls = append(message.ToolCalls, llm.ToolCall{
-				ID:   block.ID,
-				Type: "function",
-				Function: llm.ToolFunctionCall{
+			message.AppendPart(llm.Part{
+				Type: llm.PartToolUse,
+				ToolUse: &llm.ToolUsePart{
+					ID:        block.ID,
 					Name:      block.Name,
 					Arguments: arguments,
 				},
 			})
+		case "thinking":
+			thinking := block.Thinking
+			if strings.TrimSpace(thinking) == "" {
+				thinking = block.Text
+			}
+			if strings.TrimSpace(thinking) != "" {
+				message.AppendPart(llm.Part{Type: llm.PartThinking, Thinking: &llm.ThinkingPart{Value: thinking}})
+			}
+		}
+	}
+	message.Normalize()
+	contextTokens := max(0, completion.Usage.CacheReadInputTokens) + max(0, completion.Usage.CacheCreationInputTokens)
+	total := max(0, completion.Usage.InputTokens) + max(0, completion.Usage.OutputTokens) + contextTokens
+	if total > 0 {
+		message.Usage = &llm.Usage{
+			InputTokens:   max(0, completion.Usage.InputTokens),
+			OutputTokens:  max(0, completion.Usage.OutputTokens),
+			ContextTokens: contextTokens,
+			TotalTokens:   total,
 		}
 	}
 	return message, nil
@@ -120,8 +149,8 @@ func (c *Anthropic) StreamMessage(ctx context.Context, req llm.ChatRequest, onDe
 	if err != nil {
 		return llm.Message{}, err
 	}
-	if onDelta != nil && message.Content != "" {
-		onDelta(message.Content)
+	if onDelta != nil && message.Text() != "" {
+		onDelta(message.Text())
 	}
 	return message, nil
 }
@@ -138,9 +167,9 @@ func anthropicTools(tools []llm.ToolDefinition) []map[string]any {
 	return result
 }
 
-func anthropicMessages(messages []llm.Message) (string, []map[string]any) {
+func anthropicMessages(req llm.ChatRequest) (string, []map[string]any, error) {
 	systemParts := make([]string, 0, 1)
-	converted := make([]map[string]any, 0, len(messages))
+	converted := make([]map[string]any, 0, len(req.Messages))
 
 	appendMessage := func(role string, blocks []map[string]any) {
 		if len(blocks) == 0 {
@@ -157,44 +186,88 @@ func anthropicMessages(messages []llm.Message) (string, []map[string]any) {
 		})
 	}
 
-	for _, message := range messages {
-		switch message.Role {
-		case "system":
-			if strings.TrimSpace(message.Content) != "" {
-				systemParts = append(systemParts, message.Content)
-			}
-		case "user":
-			appendMessage("user", []map[string]any{{
-				"type": "text",
-				"text": message.Content,
-			}})
-		case "assistant":
-			blocks := make([]map[string]any, 0, len(message.ToolCalls)+1)
-			if strings.TrimSpace(message.Content) != "" {
-				blocks = append(blocks, map[string]any{
-					"type": "text",
-					"text": message.Content,
-				})
-			}
-			for _, call := range message.ToolCalls {
-				blocks = append(blocks, map[string]any{
-					"type":  "tool_use",
-					"id":    call.ID,
-					"name":  call.Function.Name,
-					"input": parseJSONObject(call.Function.Arguments),
-				})
-			}
-			appendMessage("assistant", blocks)
-		case "tool":
+	for _, message := range req.Messages {
+		message.Normalize()
+
+		if message.Role == "tool" {
 			appendMessage("user", []map[string]any{{
 				"type":        "tool_result",
 				"tool_use_id": message.ToolCallID,
-				"content":     message.Content,
+				"content":     message.Text(),
 			}})
+			continue
+		}
+
+		switch message.Role {
+		case llm.RoleSystem:
+			for _, part := range message.Parts {
+				if part.Text != nil && strings.TrimSpace(part.Text.Value) != "" {
+					systemParts = append(systemParts, part.Text.Value)
+				}
+			}
+		case llm.RoleUser:
+			blocks := make([]map[string]any, 0, len(message.Parts))
+			for _, part := range message.Parts {
+				switch part.Type {
+				case llm.PartText:
+					blocks = append(blocks, map[string]any{"type": "text", "text": part.Text.Value})
+				case llm.PartImageRef:
+					assetID := llm.AssetID("")
+					if part.Image != nil {
+						assetID = part.Image.AssetID
+					}
+					asset, ok := req.Assets[assetID]
+					if !ok || len(asset.Data) == 0 {
+						blocks = append(blocks, map[string]any{"type": "text", "text": missingImageAssetFallback(assetID)})
+						continue
+					}
+					mediaType := strings.TrimSpace(asset.MediaType)
+					if mediaType == "" {
+						mediaType = "image/png"
+					}
+					blocks = append(blocks, map[string]any{
+						"type": "image",
+						"source": map[string]any{
+							"type":       "base64",
+							"media_type": mediaType,
+							"data":       base64.StdEncoding.EncodeToString(asset.Data),
+						},
+					})
+				case llm.PartToolResult:
+					block := map[string]any{
+						"type":        "tool_result",
+						"tool_use_id": part.ToolResult.ToolUseID,
+						"content":     part.ToolResult.Content,
+					}
+					if part.ToolResult.IsError {
+						block["is_error"] = true
+					}
+					blocks = append(blocks, block)
+				}
+			}
+			appendMessage("user", blocks)
+		case llm.RoleAssistant:
+			blocks := make([]map[string]any, 0, len(message.Parts))
+			for _, part := range message.Parts {
+				switch part.Type {
+				case llm.PartText:
+					blocks = append(blocks, map[string]any{"type": "text", "text": part.Text.Value})
+				case llm.PartThinking:
+					blocks = append(blocks, map[string]any{"type": "text", "text": part.Thinking.Value})
+				case llm.PartToolUse:
+					blocks = append(blocks, map[string]any{
+						"type":  "tool_use",
+						"id":    part.ToolUse.ID,
+						"name":  part.ToolUse.Name,
+						"input": parseJSONObject(part.ToolUse.Arguments),
+					})
+				}
+			}
+			appendMessage("assistant", blocks)
 		}
 	}
 
-	return strings.Join(systemParts, "\n\n"), converted
+	return strings.Join(systemParts, "\n\n"), converted, nil
 }
 
 func parseJSONObject(raw string) any {
