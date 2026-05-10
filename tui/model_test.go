@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/1024XEngineer/bytemind/internal/agent"
 	"github.com/1024XEngineer/bytemind/internal/config"
@@ -5280,6 +5282,60 @@ func TestRenderMentionPaletteShowsReadyMeta(t *testing.T) {
 	if !strings.Contains(view, "index ready") {
 		t.Fatalf("expected mention palette to show ready hint, got %q", view)
 	}
+}
+
+func TestRenderMentionPaletteShowsPartialMeta(t *testing.T) {
+	index := mention.NewStaticWorkspaceFileIndex([]mention.Candidate{
+		{Path: "a.go", BaseName: "a.go", TypeTag: "go"},
+	}, 0, false)
+	setMentionIndexBoolField(index, "ready", false)
+	setMentionIndexBoolField(index, "partial", true)
+
+	m := model{
+		screen:      screenChat,
+		width:       100,
+		mentionOpen: true,
+		mentionResults: []mention.Candidate{
+			{Path: "a.go", BaseName: "a.go", TypeTag: "go"},
+		},
+		mentionIndex: index,
+	}
+
+	view := m.renderMentionPalette()
+	if !strings.Contains(view, "showing partial results") {
+		t.Fatalf("expected mention palette to show partial hint, got %q", view)
+	}
+	if strings.Contains(view, "indexing...") {
+		t.Fatalf("expected partial-only state without indexing text, got %q", view)
+	}
+}
+
+func TestRenderMentionPaletteShowsBuildingMeta(t *testing.T) {
+	index := mention.NewStaticWorkspaceFileIndex([]mention.Candidate{
+		{Path: "a.go", BaseName: "a.go", TypeTag: "go"},
+	}, 0, false)
+	setMentionIndexBoolField(index, "ready", false)
+	setMentionIndexBoolField(index, "building", true)
+
+	m := model{
+		screen:      screenChat,
+		width:       100,
+		mentionOpen: true,
+		mentionResults: []mention.Candidate{
+			{Path: "a.go", BaseName: "a.go", TypeTag: "go"},
+		},
+		mentionIndex: index,
+	}
+
+	view := m.renderMentionPalette()
+	if !strings.Contains(view, "refreshing index...") {
+		t.Fatalf("expected mention palette to show building hint, got %q", view)
+	}
+}
+
+func setMentionIndexBoolField(index *mention.WorkspaceFileIndex, name string, value bool) {
+	field := reflect.ValueOf(index).Elem().FieldByName(name)
+	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().SetBool(value)
 }
 
 func TestCommandPaletteAllowsTypingJKWhenOpen(t *testing.T) {
