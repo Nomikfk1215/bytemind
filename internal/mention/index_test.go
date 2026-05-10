@@ -250,6 +250,66 @@ func TestWorkspaceFileIndexAsyncRebuildReplacesSeed(t *testing.T) {
 	}
 }
 
+func TestWorkspaceFileIndexPrewarmBuildsFullIndex(t *testing.T) {
+	workspace := t.TempDir()
+	mustWriteMentionFile(t, filepath.Join(workspace, "deep", "a", "b", "target.go"), "package main")
+
+	index := NewWorkspaceFileIndex(workspace)
+	index.Prewarm()
+
+	results := index.Search("target", 10)
+	if len(results) == 0 || results[0].Path != "deep/a/b/target.go" {
+		t.Fatalf("expected prewarm to build full index, got %#v", results)
+	}
+	stats := index.Stats()
+	if !stats.Ready || stats.Building || stats.Partial {
+		t.Fatalf("expected ready non-building stats after prewarm, got %+v", stats)
+	}
+}
+
+func TestBuildMentionSeedRespectsReadLimitAndSortsEntries(t *testing.T) {
+	workspace := t.TempDir()
+	mustWriteMentionFile(t, filepath.Join(workspace, "b.go"), "package main")
+	mustWriteMentionFile(t, filepath.Join(workspace, "a.go"), "package main")
+	mustWriteMentionFile(t, filepath.Join(workspace, "c.go"), "package main")
+	t.Setenv("BYTEMIND_MENTION_MAX_VISITS", "1")
+
+	files, truncated := buildMentionSeed(workspace, 10, mentionIgnoreMatcher{})
+	if !truncated {
+		t.Fatalf("expected seed build to be truncated by read limit")
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected one seeded file under visit limit, got %d (%#v)", len(files), files)
+	}
+	if files[0].TypeTag != "go" {
+		t.Fatalf("expected seeded file metadata to be populated, got %#v", files)
+	}
+}
+
+func TestReadMentionSeedDirEdgeCases(t *testing.T) {
+	workspace := t.TempDir()
+	mustWriteMentionFile(t, filepath.Join(workspace, "b.go"), "package main")
+	mustWriteMentionFile(t, filepath.Join(workspace, "a.go"), "package main")
+
+	entries, hitLimit := readMentionSeedDir(workspace, 0)
+	if len(entries) != 0 || !hitLimit {
+		t.Fatalf("expected zero-limit read to hit limit with no entries, got %d %t", len(entries), hitLimit)
+	}
+
+	entries, hitLimit = readMentionSeedDir(filepath.Join(workspace, "missing"), 2)
+	if len(entries) != 0 || hitLimit {
+		t.Fatalf("expected missing dir read to return no entries without limit hit, got %d %t", len(entries), hitLimit)
+	}
+
+	entries, hitLimit = readMentionSeedDir(workspace, 2)
+	if !hitLimit {
+		t.Fatalf("expected exact read limit to report truncation")
+	}
+	if len(entries) != 2 || entries[0].Name() != "a.go" || entries[1].Name() != "b.go" {
+		t.Fatalf("expected sorted directory entries, got %#v", entries)
+	}
+}
+
 func TestWorkspaceFileIndexUsesTriePrefixRecall(t *testing.T) {
 	idx := NewStaticWorkspaceFileIndex([]Candidate{
 		{Path: "README.md"},
